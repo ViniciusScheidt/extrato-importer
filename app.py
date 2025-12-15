@@ -8,13 +8,23 @@ import pdfplumber
 from openpyxl import load_workbook
 from openpyxl.styles import numbers
 
+
+# =========================
+# Utilitários
+# =========================
+
 def brl_to_float(s: str) -> float:
+    """
+    Converte string BRL para float.
+    Aceita: "1.234,56", "-1.234,56", "R$ 1.234,56", "- R$ 0,29"
+    """
     s = s.strip().replace("R$", "").replace(" ", "")
     neg = s.startswith("-")
     s = s.replace("-", "")
     s = s.replace(".", "").replace(",", ".")
     v = float(s)
     return -v if neg else v
+
 
 def format_cpf_cnpj(num: str) -> str:
     num = re.sub(r"\D+", "", num)
@@ -23,6 +33,7 @@ def format_cpf_cnpj(num: str) -> str:
     if len(num) == 14:
         return f"{num[0:2]}.{num[2:5]}.{num[5:8]}/{num[8:12]}-{num[12:14]}"
     return ""
+
 
 def read_pdf_lines(pdf_path: str) -> list[str]:
     lines: list[str] = []
@@ -34,6 +45,7 @@ def read_pdf_lines(pdf_path: str) -> list[str]:
                 if ln:
                     lines.append(ln)
     return lines
+
 
 def detect_bank(pdf_path: str) -> str:
     lines = read_pdf_lines(pdf_path)[:200]
@@ -47,33 +59,45 @@ def detect_bank(pdf_path: str) -> str:
         return "STONE"
     return "UNKNOWN"
 
-def parse_sicredi(pdf_path: str, only_outgoing: bool=True) -> list[dict]:
+
+# =========================
+# Parsers
+# =========================
+
+def parse_sicredi(pdf_path: str, only_outgoing: bool = True) -> list[dict]:
     lines = read_pdf_lines(pdf_path)
     txs: list[dict] = []
+
     date_re = re.compile(r"^(\d{2}/\d{2}/\d{4})\s+(.*)$")
 
     for ln in lines:
         m = date_re.match(ln)
         if not m:
             continue
+
         date_str, rest = m.group(1), m.group(2)
 
+        # Regras do Sicredi: apenas PAGAMENTO PIX e LIQUIDACAO BOLETO
         if ("PAGAMENTO PIX" not in rest) and ("LIQUIDACAO BOLETO" not in rest):
             continue
 
+        # Geralmente a linha termina com "valor saldo" → pega penúltimo número (valor)
         nums = re.findall(r"-?\d{1,3}(?:\.\d{3})*,\d{2}", ln)
         if not nums:
             continue
         valor_str = nums[-2] if len(nums) >= 2 else nums[-1]
         valor = brl_to_float(valor_str)
 
+        # Pagamentos costumam vir negativos; se only_outgoing, filtra positivos
         if only_outgoing and valor >= 0:
             continue
 
+        # CPF/CNPJ está na descrição em muitos casos
         merged = rest.replace(" ", "")
         id_match = re.search(r"(\d{11}|\d{14})", merged) or re.search(r"(\d{11}|\d{14})", rest)
         cpf_cnpj = format_cpf_cnpj(id_match.group(1)) if id_match else ""
 
+        # Remove valores no final da descrição (se existirem)
         desc = rest
         desc = re.sub(r"\s+-?\d{1,3}(?:\.\d{3})*,\d{2}\s+-?\d{1,3}(?:\.\d{3})*,\d{2}$", "", desc)
         desc = re.sub(r"\s+-?\d{1,3}(?:\.\d{3})*,\d{2}$", "", desc)
@@ -83,15 +107,19 @@ def parse_sicredi(pdf_path: str, only_outgoing: bool=True) -> list[dict]:
 
     return txs
 
-def parse_pagbank(pdf_path: str, only_outgoing: bool=True, ignore_balance: bool=True) -> list[dict]:
+
+def parse_pagbank(pdf_path: str, only_outgoing: bool = True, ignore_balance: bool = True) -> list[dict]:
     lines = read_pdf_lines(pdf_path)
     txs: list[dict] = []
+
+    # Ex.: 01/11/2025 Vendas - Disponivel DEBITO MASTERCARD R$ 39,14
     line_re = re.compile(r"^(\d{2}/\d{2}/\d{4})\s+(.*?)\s+R\$\s*([0-9\.\,]+)$")
 
     for ln in lines:
         m = line_re.match(ln)
         if not m:
             continue
+
         date_str, desc, val_str = m.group(1), m.group(2), m.group(3)
 
         if ignore_balance and ("Saldo do dia" in desc or "Rendimento" in desc):
@@ -100,6 +128,8 @@ def parse_pagbank(pdf_path: str, only_outgoing: bool=True, ignore_balance: bool=
         dt = datetime.datetime.strptime(date_str, "%d/%m/%Y").date()
         valor = brl_to_float(val_str)
 
+        # PagBank nesse layout normalmente é entrada (positiva).
+        # Se only_outgoing, ele vai filtrar tudo que for positivo.
         if only_outgoing and valor >= 0:
             continue
 
@@ -107,9 +137,12 @@ def parse_pagbank(pdf_path: str, only_outgoing: bool=True, ignore_balance: bool=
 
     return txs
 
-def parse_stone(pdf_path: str, only_outgoing: bool=True, ignore_fees: bool=True) -> list[dict]:
+
+def parse_stone(pdf_path: str, only_outgoing: bool = True, ignore_fees: bool = True) -> list[dict]:
     lines = read_pdf_lines(pdf_path)
     txs: list[dict] = []
+
+    # Ex.: 30/11/25 Saída Tarifa - R$ 0,29 ...
     row_re = re.compile(r"^(\d{2}/\d{2}/\d{2})\s+(Entrada|Saída)\s+(.*?)\s+(-?\s*R\$\s*[0-9\.\,]+)")
 
     buf: list[str] = []
@@ -119,11 +152,13 @@ def parse_stone(pdf_path: str, only_outgoing: bool=True, ignore_fees: bool=True)
 
         m = row_re.match(joined)
         if not m:
+            # evita buffer crescer infinito se o PDF quebrar muito
             if len(buf) > 6:
                 buf = buf[-3:]
             continue
 
         buf = []
+
         date_str, typ, desc, val_str = m.group(1), m.group(2), m.group(3), m.group(4)
         dt = datetime.datetime.strptime(date_str, "%d/%m/%y").date()
 
@@ -135,8 +170,10 @@ def parse_stone(pdf_path: str, only_outgoing: bool=True, ignore_fees: bool=True)
         if only_outgoing:
             if typ != "Saída":
                 continue
+            # garante saída como negativa
             valor = -abs(valor)
 
+        # tenta achar CPF/CNPJ na descrição (nem sempre tem)
         digits = re.sub(r"\D+", "", desc)
         cpf_cnpj = ""
         m_id = re.search(r"(\d{11}|\d{14})", digits)
@@ -146,6 +183,11 @@ def parse_stone(pdf_path: str, only_outgoing: bool=True, ignore_fees: bool=True)
         txs.append({"date": dt, "cpf_cnpj": cpf_cnpj, "desc": desc, "valor_pago": abs(valor)})
 
     return txs
+
+
+# =========================
+# Writer (planilha)
+# =========================
 
 REQUIRED_HEADERS = [
     "Número da Nota",
@@ -160,19 +202,28 @@ REQUIRED_HEADERS = [
     "Caixa/Banco",
 ]
 
-def fill_sheet(xlsx_path: str, out_path: str, sheet_name: str, txs: list[dict], bank_code: int, caixa_banco: str):
+
+def fill_sheet(
+    xlsx_path: str,
+    out_path: str,
+    sheet_name: str,
+    txs: list[dict],
+    bank_code: int,
+    caixa_banco: str,
+):
     wb = load_workbook(xlsx_path)
     if sheet_name not in wb.sheetnames:
         raise ValueError(f"Aba '{sheet_name}' não existe na planilha.")
     ws = wb[sheet_name]
 
     headers = [c.value for c in ws[1]]
-    col = {h: i+1 for i, h in enumerate(headers) if h}
+    col = {h: i + 1 for i, h in enumerate(headers) if h}
 
     for h in REQUIRED_HEADERS:
         if h not in col:
             raise ValueError(f"Coluna obrigatória não encontrada na aba '{sheet_name}': {h}")
 
+    # limpa tudo abaixo do cabeçalho (primeiras 10 colunas do layout)
     for r in range(2, ws.max_row + 1):
         for c in range(1, 11):
             ws.cell(row=r, column=c).value = None
@@ -209,11 +260,16 @@ def fill_sheet(xlsx_path: str, out_path: str, sheet_name: str, txs: list[dict], 
 
     wb.save(out_path)
 
+
+# =========================
+# UI
+# =========================
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Extrato → Planilha Contábil (Sicredi/PagBank/Stone)")
-        self.geometry("820x320")
+        self.geometry("820x340")
 
         self.xlsx_path = tk.StringVar()
         self.pdf_path = tk.StringVar()
@@ -228,27 +284,32 @@ class App(tk.Tk):
     def _build(self):
         pad = {"padx": 10, "pady": 6}
 
-        frm1 = tk.Frame(self); frm1.pack(fill="x", **pad)
+        frm1 = tk.Frame(self)
+        frm1.pack(fill="x", **pad)
         tk.Label(frm1, text="Planilha (.xlsx):", width=18, anchor="w").pack(side="left")
         tk.Entry(frm1, textvariable=self.xlsx_path).pack(side="left", fill="x", expand=True)
         tk.Button(frm1, text="Selecionar", command=self.pick_xlsx).pack(side="left", padx=8)
 
-        frm2 = tk.Frame(self); frm2.pack(fill="x", **pad)
+        frm2 = tk.Frame(self)
+        frm2.pack(fill="x", **pad)
         tk.Label(frm2, text="Aba (Banco):", width=18, anchor="w").pack(side="left")
         self.sheet_combo = ttk.Combobox(frm2, textvariable=self.sheet_name, state="readonly")
         self.sheet_combo.pack(side="left", fill="x", expand=True)
 
-        frm3 = tk.Frame(self); frm3.pack(fill="x", **pad)
+        frm3 = tk.Frame(self)
+        frm3.pack(fill="x", **pad)
         tk.Label(frm3, text="Extrato (.pdf):", width=18, anchor="w").pack(side="left")
         tk.Entry(frm3, textvariable=self.pdf_path).pack(side="left", fill="x", expand=True)
         tk.Button(frm3, text="Selecionar", command=self.pick_pdf).pack(side="left", padx=8)
 
-        frmF = tk.Frame(self); frmF.pack(fill="x", **pad)
+        frmF = tk.Frame(self)
+        frmF.pack(fill="x", **pad)
         tk.Checkbutton(frmF, text="Somente saídas (pagamentos)", variable=self.only_outgoing).pack(anchor="w")
         tk.Checkbutton(frmF, text="Ignorar tarifas (Stone)", variable=self.ignore_fees).pack(anchor="w")
         tk.Checkbutton(frmF, text="Ignorar “Saldo do dia”/Rendimento (PagBank)", variable=self.ignore_balance).pack(anchor="w")
 
-        frm4 = tk.Frame(self); frm4.pack(fill="x", **pad)
+        frm4 = tk.Frame(self)
+        frm4.pack(fill="x", **pad)
         tk.Button(frm4, text="Processar", command=self.process, height=2).pack(side="right")
 
         self.lbl_info = tk.Label(self, text="", fg="gray")
@@ -258,18 +319,44 @@ class App(tk.Tk):
         path = filedialog.askopenfilename(filetypes=[("Excel", "*.xlsx")])
         if not path:
             return
+
         self.xlsx_path.set(path)
-        wb = load_workbook(path, read_only=True, data_only=True)
-        self.sheet_combo["values"] = wb.sheetnames
-        if wb.sheetnames:
-            self.sheet_name.set(wb.sheetnames[0])
+
+        # ✅ Correção: não usar read_only=True (no Windows pode dar falha silenciosa / combo vazio)
+        try:
+            wb = load_workbook(path, data_only=True)
+            sheets = wb.sheetnames
+        except Exception as e:
+            messagebox.showerror(
+                "Erro ao ler planilha",
+                "Não foi possível carregar as abas da planilha.\n\n"
+                "Dicas:\n"
+                "- Feche a planilha no Excel e tente novamente\n"
+                "- Evite abrir direto do OneDrive/rede; copie para uma pasta local\n\n"
+                f"Detalhe técnico: {str(e)}"
+            )
+            return
+
+        if not sheets:
+            messagebox.showerror("Erro", "Nenhuma aba encontrada na planilha.")
+            return
+
+        self.sheet_combo["values"] = sheets
+        self.sheet_name.set(sheets[0])
 
     def pick_pdf(self):
         path = filedialog.askopenfilename(filetypes=[("PDF", "*.pdf")])
         if not path:
             return
+
         self.pdf_path.set(path)
-        bank = detect_bank(path)
+
+        try:
+            bank = detect_bank(path)
+        except Exception as e:
+            messagebox.showerror("Erro", f"Não consegui ler o PDF.\n\n{str(e)}")
+            return
+
         self.lbl_info.config(text=f"Banco detectado: {bank}")
 
     def process(self):
@@ -311,9 +398,11 @@ class App(tk.Tk):
                 bank_code=8,
                 caixa_banco=sheet,
             )
+
             messagebox.showinfo("OK", f"Arquivo gerado:\n{out_path}")
         except Exception as e:
             messagebox.showerror("Falhou", str(e))
+
 
 if __name__ == "__main__":
     App().mainloop()
