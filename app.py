@@ -2,7 +2,8 @@ import os
 import re
 import datetime
 import tkinter as tk
-from tkinter import filedialog, ttk, messagebox
+from tkinter import filedialog, messagebox
+from tkinter import ttk
 
 import pdfplumber
 from openpyxl import load_workbook
@@ -10,7 +11,7 @@ from openpyxl.styles import numbers
 
 
 # =========================
-# Utilitários
+# Utils
 # =========================
 
 def brl_to_float(s: str) -> float:
@@ -48,14 +49,14 @@ def read_pdf_lines(pdf_path: str) -> list[str]:
 
 
 def detect_bank(pdf_path: str) -> str:
-    lines = read_pdf_lines(pdf_path)[:200]
-    blob = "\n".join(lines)
+    blob = "\n".join(read_pdf_lines(pdf_path)[:250]).upper()
 
-    if "Sicredi" in blob or ("SICREDI" in blob.upper() and "COOPERATIVA" in blob.upper()):
+    # heurísticas simples
+    if "SICREDI" in blob:
         return "SICREDI"
-    if "PagSeguro" in blob or "PAGBANK" in blob.upper() or "PagBank" in blob:
+    if "PAGBANK" in blob or "PAGSEGURO" in blob:
         return "PAGBANK"
-    if "Stone Instituição de Pagamento" in blob or "STONE" in blob.upper():
+    if "STONE" in blob:
         return "STONE"
     return "UNKNOWN"
 
@@ -65,6 +66,12 @@ def detect_bank(pdf_path: str) -> str:
 # =========================
 
 def parse_sicredi(pdf_path: str, only_outgoing: bool = True) -> list[dict]:
+    """
+    Sicredi:
+    - Aceita: PAGAMENTO PIX / LIQUIDACAO BOLETO / QUALQUER DEBITO CONVENIO
+    - Valor pago = abs(valor)
+    - Data baixa = data do extrato
+    """
     lines = read_pdf_lines(pdf_path)
     txs: list[dict] = []
 
@@ -76,43 +83,57 @@ def parse_sicredi(pdf_path: str, only_outgoing: bool = True) -> list[dict]:
             continue
 
         date_str, rest = m.group(1), m.group(2)
+        full = ln.upper()
 
-        # Regras do Sicredi: apenas PAGAMENTO PIX e LIQUIDACAO BOLETO
-        if ("PAGAMENTO PIX" not in rest) and ("LIQUIDACAO BOLETO" not in rest):
+        # ✅ Regra pedida: qualquer débito convênio
+        if (
+            "PAGAMENTO PIX" not in full
+            and "LIQUIDACAO BOLETO" not in full
+            and "DEBITO CONVENIO" not in full
+        ):
             continue
 
-        # Geralmente a linha termina com "valor saldo" → pega penúltimo número (valor)
+        # geralmente termina com "valor saldo" -> usa penúltimo número como valor
         nums = re.findall(r"-?\d{1,3}(?:\.\d{3})*,\d{2}", ln)
         if not nums:
             continue
+
         valor_str = nums[-2] if len(nums) >= 2 else nums[-1]
         valor = brl_to_float(valor_str)
 
-        # Pagamentos costumam vir negativos; se only_outgoing, filtra positivos
+        # saída geralmente vem negativa
         if only_outgoing and valor >= 0:
             continue
 
-        # CPF/CNPJ está na descrição em muitos casos
+        # CPF/CNPJ pode estar contido no texto
         merged = rest.replace(" ", "")
         id_match = re.search(r"(\d{11}|\d{14})", merged) or re.search(r"(\d{11}|\d{14})", rest)
         cpf_cnpj = format_cpf_cnpj(id_match.group(1)) if id_match else ""
 
-        # Remove valores no final da descrição (se existirem)
+        # descrição sem os valores finais
         desc = rest
         desc = re.sub(r"\s+-?\d{1,3}(?:\.\d{3})*,\d{2}\s+-?\d{1,3}(?:\.\d{3})*,\d{2}$", "", desc)
         desc = re.sub(r"\s+-?\d{1,3}(?:\.\d{3})*,\d{2}$", "", desc)
 
         dt = datetime.datetime.strptime(date_str, "%d/%m/%Y").date()
-        txs.append({"date": dt, "cpf_cnpj": cpf_cnpj, "desc": desc, "valor_pago": abs(valor)})
+        txs.append({
+            "date": dt,
+            "cpf_cnpj": cpf_cnpj,
+            "desc": desc,
+            "valor_pago": abs(valor),
+        })
 
     return txs
 
 
 def parse_pagbank(pdf_path: str, only_outgoing: bool = True, ignore_balance: bool = True) -> list[dict]:
+    """
+    PagBank (layout simples):
+    01/11/2025 ... R$ 39,14
+    """
     lines = read_pdf_lines(pdf_path)
     txs: list[dict] = []
 
-    # Ex.: 01/11/2025 Vendas - Disponivel DEBITO MASTERCARD R$ 39,14
     line_re = re.compile(r"^(\d{2}/\d{2}/\d{4})\s+(.*?)\s+R\$\s*([0-9\.\,]+)$")
 
     for ln in lines:
@@ -121,29 +142,36 @@ def parse_pagbank(pdf_path: str, only_outgoing: bool = True, ignore_balance: boo
             continue
 
         date_str, desc, val_str = m.group(1), m.group(2), m.group(3)
-
-        if ignore_balance and ("Saldo do dia" in desc or "Rendimento" in desc):
+        if ignore_balance and ("SALDO DO DIA" in desc.upper() or "RENDIMENTO" in desc.upper()):
             continue
 
         dt = datetime.datetime.strptime(date_str, "%d/%m/%Y").date()
         valor = brl_to_float(val_str)
 
-        # PagBank nesse layout normalmente é entrada (positiva).
-        # Se only_outgoing, ele vai filtrar tudo que for positivo.
         if only_outgoing and valor >= 0:
             continue
 
-        txs.append({"date": dt, "cpf_cnpj": "", "desc": desc, "valor_pago": abs(valor)})
+        txs.append({
+            "date": dt,
+            "cpf_cnpj": "",
+            "desc": desc,
+            "valor_pago": abs(valor),
+        })
 
     return txs
 
 
 def parse_stone(pdf_path: str, only_outgoing: bool = True, ignore_fees: bool = True) -> list[dict]:
+    """
+    Stone (tabela):
+    30/11/25 Saída ... - R$ 0,29 ...
+    """
     lines = read_pdf_lines(pdf_path)
     txs: list[dict] = []
 
-    # Ex.: 30/11/25 Saída Tarifa - R$ 0,29 ...
-    row_re = re.compile(r"^(\d{2}/\d{2}/\d{2})\s+(Entrada|Saída)\s+(.*?)\s+(-?\s*R\$\s*[0-9\.\,]+)")
+    row_re = re.compile(
+        r"^(\d{2}/\d{2}/\d{2})\s+(Entrada|Saída)\s+(.*?)\s+(-?\s*R\$\s*[0-9\.\,]+)"
+    )
 
     buf: list[str] = []
     for ln in lines:
@@ -152,17 +180,15 @@ def parse_stone(pdf_path: str, only_outgoing: bool = True, ignore_fees: bool = T
 
         m = row_re.match(joined)
         if not m:
-            # evita buffer crescer infinito se o PDF quebrar muito
             if len(buf) > 6:
                 buf = buf[-3:]
             continue
 
         buf = []
-
         date_str, typ, desc, val_str = m.group(1), m.group(2), m.group(3), m.group(4)
         dt = datetime.datetime.strptime(date_str, "%d/%m/%y").date()
 
-        if ignore_fees and "Tarifa" in desc:
+        if ignore_fees and "TARIFA" in desc.upper():
             continue
 
         valor = brl_to_float(val_str)
@@ -170,23 +196,26 @@ def parse_stone(pdf_path: str, only_outgoing: bool = True, ignore_fees: bool = T
         if only_outgoing:
             if typ != "Saída":
                 continue
-            # garante saída como negativa
             valor = -abs(valor)
 
-        # tenta achar CPF/CNPJ na descrição (nem sempre tem)
         digits = re.sub(r"\D+", "", desc)
         cpf_cnpj = ""
         m_id = re.search(r"(\d{11}|\d{14})", digits)
         if m_id:
             cpf_cnpj = format_cpf_cnpj(m_id.group(1))
 
-        txs.append({"date": dt, "cpf_cnpj": cpf_cnpj, "desc": desc, "valor_pago": abs(valor)})
+        txs.append({
+            "date": dt,
+            "cpf_cnpj": cpf_cnpj,
+            "desc": desc,
+            "valor_pago": abs(valor),
+        })
 
     return txs
 
 
 # =========================
-# Writer (planilha)
+# Writer
 # =========================
 
 REQUIRED_HEADERS = [
@@ -214,8 +243,8 @@ def fill_sheet(
     wb = load_workbook(xlsx_path)
     if sheet_name not in wb.sheetnames:
         raise ValueError(f"Aba '{sheet_name}' não existe na planilha.")
-    ws = wb[sheet_name]
 
+    ws = wb[sheet_name]
     headers = [c.value for c in ws[1]]
     col = {h: i + 1 for i, h in enumerate(headers) if h}
 
@@ -262,14 +291,13 @@ def fill_sheet(
 
 
 # =========================
-# UI
+# UI (mais moderna)
 # =========================
 
-class App(tk.Tk):
-    def __init__(self):
-        super().__init__()
-        self.title("Extrato → Planilha Contábil (Sicredi/PagBank/Stone)")
-        self.geometry("820x340")
+class App(ttk.Frame):
+    def __init__(self, master: tk.Tk):
+        super().__init__(master)
+        self.master = master
 
         self.xlsx_path = tk.StringVar()
         self.pdf_path = tk.StringVar()
@@ -279,41 +307,106 @@ class App(tk.Tk):
         self.ignore_fees = tk.BooleanVar(value=True)
         self.ignore_balance = tk.BooleanVar(value=True)
 
-        self._build()
+        self.detected_bank = tk.StringVar(value="—")
 
-    def _build(self):
-        pad = {"padx": 10, "pady": 6}
+        self._build_styles()
+        self._build_layout()
 
-        frm1 = tk.Frame(self)
-        frm1.pack(fill="x", **pad)
-        tk.Label(frm1, text="Planilha (.xlsx):", width=18, anchor="w").pack(side="left")
-        tk.Entry(frm1, textvariable=self.xlsx_path).pack(side="left", fill="x", expand=True)
-        tk.Button(frm1, text="Selecionar", command=self.pick_xlsx).pack(side="left", padx=8)
+    def _build_styles(self):
+        self.master.title("Importador de Extratos → Planilha (Sicredi / PagBank / Stone)")
+        self.master.geometry("860x420")
+        self.master.minsize(860, 420)
 
-        frm2 = tk.Frame(self)
-        frm2.pack(fill="x", **pad)
-        tk.Label(frm2, text="Aba (Banco):", width=18, anchor="w").pack(side="left")
-        self.sheet_combo = ttk.Combobox(frm2, textvariable=self.sheet_name, state="readonly")
-        self.sheet_combo.pack(side="left", fill="x", expand=True)
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
 
-        frm3 = tk.Frame(self)
-        frm3.pack(fill="x", **pad)
-        tk.Label(frm3, text="Extrato (.pdf):", width=18, anchor="w").pack(side="left")
-        tk.Entry(frm3, textvariable=self.pdf_path).pack(side="left", fill="x", expand=True)
-        tk.Button(frm3, text="Selecionar", command=self.pick_pdf).pack(side="left", padx=8)
+        style.configure("TFrame", background="#f5f6f8")
+        style.configure("Card.TFrame", background="white", relief="flat")
+        style.configure("Title.TLabel", font=("Segoe UI", 14, "bold"), background="#f5f6f8")
+        style.configure("Subtitle.TLabel", font=("Segoe UI", 10), foreground="#555", background="#f5f6f8")
+        style.configure("CardTitle.TLabel", font=("Segoe UI", 11, "bold"), background="white")
+        style.configure("Muted.TLabel", font=("Segoe UI", 9), foreground="#666")
+        style.configure("Status.TLabel", font=("Segoe UI", 9), foreground="#333", background="#f5f6f8")
 
-        frmF = tk.Frame(self)
-        frmF.pack(fill="x", **pad)
-        tk.Checkbutton(frmF, text="Somente saídas (pagamentos)", variable=self.only_outgoing).pack(anchor="w")
-        tk.Checkbutton(frmF, text="Ignorar tarifas (Stone)", variable=self.ignore_fees).pack(anchor="w")
-        tk.Checkbutton(frmF, text="Ignorar “Saldo do dia”/Rendimento (PagBank)", variable=self.ignore_balance).pack(anchor="w")
+        style.configure("Primary.TButton", font=("Segoe UI", 10, "bold"))
+        style.configure("TButton", font=("Segoe UI", 10))
+        style.configure("TCheckbutton", background="white")
 
-        frm4 = tk.Frame(self)
-        frm4.pack(fill="x", **pad)
-        tk.Button(frm4, text="Processar", command=self.process, height=2).pack(side="right")
+        style.configure("TEntry", padding=6)
+        style.configure("TCombobox", padding=4)
 
-        self.lbl_info = tk.Label(self, text="", fg="gray")
-        self.lbl_info.pack(fill="x", padx=10, pady=10)
+    def _build_layout(self):
+        self.pack(fill="both", expand=True, padx=16, pady=16)
+
+        # Header
+        header = ttk.Frame(self)
+        header.pack(fill="x", pady=(0, 12))
+        ttk.Label(header, text="Importador de Extratos", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(
+            header,
+            text="Selecione a planilha, escolha a aba do banco, selecione o PDF do extrato e processe.",
+            style="Subtitle.TLabel",
+        ).pack(anchor="w", pady=(2, 0))
+
+        # Main cards container
+        cards = ttk.Frame(self)
+        cards.pack(fill="both", expand=True)
+
+        # Card: arquivos
+        card_files = ttk.Frame(cards, style="Card.TFrame")
+        card_files.pack(fill="x", pady=(0, 12))
+        card_files.configure(padding=14)
+
+        ttk.Label(card_files, text="Arquivos", style="CardTitle.TLabel").grid(row=0, column=0, sticky="w", columnspan=3, pady=(0, 10))
+
+        ttk.Label(card_files, text="Planilha (.xlsx)", style="Muted.TLabel").grid(row=1, column=0, sticky="w")
+        self.ent_xlsx = ttk.Entry(card_files, textvariable=self.xlsx_path)
+        self.ent_xlsx.grid(row=2, column=0, sticky="ew", padx=(0, 8))
+        ttk.Button(card_files, text="Selecionar…", command=self.pick_xlsx).grid(row=2, column=1, sticky="ew")
+
+        ttk.Label(card_files, text="Aba (Banco)", style="Muted.TLabel").grid(row=1, column=2, sticky="w", padx=(12, 0))
+        self.sheet_combo = ttk.Combobox(card_files, textvariable=self.sheet_name, state="readonly")
+        self.sheet_combo.grid(row=2, column=2, sticky="ew", padx=(12, 0))
+
+        ttk.Label(card_files, text="Extrato (.pdf)", style="Muted.TLabel").grid(row=3, column=0, sticky="w", pady=(10, 0))
+        self.ent_pdf = ttk.Entry(card_files, textvariable=self.pdf_path)
+        self.ent_pdf.grid(row=4, column=0, sticky="ew", padx=(0, 8))
+        ttk.Button(card_files, text="Selecionar…", command=self.pick_pdf).grid(row=4, column=1, sticky="ew")
+
+        ttk.Label(card_files, text="Banco detectado", style="Muted.TLabel").grid(row=3, column=2, sticky="w", padx=(12, 0), pady=(10, 0))
+        ttk.Label(card_files, textvariable=self.detected_bank, style="CardTitle.TLabel").grid(row=4, column=2, sticky="w", padx=(12, 0))
+
+        card_files.columnconfigure(0, weight=3)
+        card_files.columnconfigure(1, weight=0)
+        card_files.columnconfigure(2, weight=2)
+
+        # Card: opções
+        card_opts = ttk.Frame(cards, style="Card.TFrame")
+        card_opts.pack(fill="x", pady=(0, 12))
+        card_opts.configure(padding=14)
+
+        ttk.Label(card_opts, text="Opções", style="CardTitle.TLabel").pack(anchor="w", pady=(0, 8))
+
+        ttk.Checkbutton(card_opts, text="Somente saídas (pagamentos)", variable=self.only_outgoing).pack(anchor="w")
+        ttk.Checkbutton(card_opts, text="Ignorar tarifas (Stone)", variable=self.ignore_fees).pack(anchor="w")
+        ttk.Checkbutton(card_opts, text="Ignorar “Saldo do dia”/Rendimento (PagBank)", variable=self.ignore_balance).pack(anchor="w")
+
+        # Footer actions
+        footer = ttk.Frame(self)
+        footer.pack(fill="x")
+
+        self.status = tk.StringVar(value="Pronto.")
+        ttk.Label(footer, textvariable=self.status, style="Status.TLabel").pack(side="left")
+
+        self.btn_process = ttk.Button(footer, text="Processar", style="Primary.TButton", command=self.process)
+        self.btn_process.pack(side="right")
+
+    def _set_status(self, msg: str):
+        self.status.set(msg)
+        self.master.update_idletasks()
 
     def pick_xlsx(self):
         path = filedialog.askopenfilename(filetypes=[("Excel", "*.xlsx")])
@@ -321,8 +414,9 @@ class App(tk.Tk):
             return
 
         self.xlsx_path.set(path)
+        self._set_status("Lendo abas da planilha…")
 
-        # ✅ Correção: não usar read_only=True (no Windows pode dar falha silenciosa / combo vazio)
+        # ✅ Correção: não usar read_only=True (evita combo vazio / falha silenciosa em Windows)
         try:
             wb = load_workbook(path, data_only=True)
             sheets = wb.sheetnames
@@ -332,17 +426,20 @@ class App(tk.Tk):
                 "Não foi possível carregar as abas da planilha.\n\n"
                 "Dicas:\n"
                 "- Feche a planilha no Excel e tente novamente\n"
-                "- Evite abrir direto do OneDrive/rede; copie para uma pasta local\n\n"
-                f"Detalhe técnico: {str(e)}"
+                "- Copie para uma pasta local (evite OneDrive/rede)\n\n"
+                f"Detalhe: {str(e)}"
             )
+            self._set_status("Falha ao ler a planilha.")
             return
 
         if not sheets:
             messagebox.showerror("Erro", "Nenhuma aba encontrada na planilha.")
+            self._set_status("Nenhuma aba encontrada.")
             return
 
         self.sheet_combo["values"] = sheets
         self.sheet_name.set(sheets[0])
+        self._set_status("Planilha carregada. Selecione a aba e o PDF.")
 
     def pick_pdf(self):
         path = filedialog.askopenfilename(filetypes=[("PDF", "*.pdf")])
@@ -350,14 +447,17 @@ class App(tk.Tk):
             return
 
         self.pdf_path.set(path)
+        self._set_status("Lendo PDF e detectando banco…")
 
         try:
             bank = detect_bank(path)
         except Exception as e:
             messagebox.showerror("Erro", f"Não consegui ler o PDF.\n\n{str(e)}")
+            self._set_status("Falha ao ler PDF.")
             return
 
-        self.lbl_info.config(text=f"Banco detectado: {bank}")
+        self.detected_bank.set(bank)
+        self._set_status(f"PDF selecionado. Banco detectado: {bank}")
 
     def process(self):
         xlsx = self.xlsx_path.get().strip()
@@ -374,10 +474,19 @@ class App(tk.Tk):
             messagebox.showerror("Erro", "Selecione uma aba.")
             return
 
-        bank = detect_bank(pdf)
+        bank = self.detected_bank.get()
+        if bank == "—" or bank == "UNKNOWN":
+            # tenta detectar na hora, caso o usuário não tenha clicado no botão do PDF antes
+            bank = detect_bank(pdf)
+            self.detected_bank.set(bank)
+
         if bank == "UNKNOWN":
             messagebox.showerror("Erro", "Não consegui detectar o banco do PDF.")
             return
+
+        # UI feedback
+        self.btn_process.configure(state="disabled")
+        self._set_status("Processando…")
 
         try:
             if bank == "SICREDI":
@@ -399,10 +508,26 @@ class App(tk.Tk):
                 caixa_banco=sheet,
             )
 
-            messagebox.showinfo("OK", f"Arquivo gerado:\n{out_path}")
+            messagebox.showinfo("OK", f"Arquivo gerado:\n{out_path}\n\nRegistros importados: {len(txs)}")
+            self._set_status(f"Concluído. Registros: {len(txs)}")
         except Exception as e:
             messagebox.showerror("Falhou", str(e))
+            self._set_status("Falhou.")
+        finally:
+            self.btn_process.configure(state="normal")
+
+
+def main():
+    root = tk.Tk()
+    # melhora a aparência no Windows (DPI / fonte)
+    try:
+        root.tk.call("tk", "scaling", 1.1)
+    except Exception:
+        pass
+
+    App(root)
+    root.mainloop()
 
 
 if __name__ == "__main__":
-    App().mainloop()
+    main()
